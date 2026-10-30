@@ -3,6 +3,8 @@ uvicorn[standard]
 pydantic
 filelock
 python-dotenv
-google-generativeai
+httpx
+requests
+websocket-client
 python-multipart
 # python-multipart is a dependency of fastapi for form data, good to have it explicit.

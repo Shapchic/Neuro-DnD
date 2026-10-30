@@ -7,8 +7,10 @@ echo Upgrading pip...
 python -m pip install --upgrade pip
 echo Installing dependencies from requirements.txt...
 pip install -r requirements.txt
-echo Creating .env file...
-echo GEMINI_API_KEY=__PUT_YOUR_KEY_HERE__> .env
+if not exist .env (
+    echo Creating .env file from .env.example...
+    copy .env.example .env
+)
 echo.
-echo Setup complete. Please edit the .env file and add your GEMINI_API_KEY.
+echo Setup complete. Qwen local inference is configured in .env.
 pause
