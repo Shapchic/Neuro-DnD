@@ -1,6 +1,6 @@
 import re
 import json
-import google.generativeai as genai
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
 from server.core import config, storage
@@ -14,7 +14,7 @@ def parse_ai_response(response_text: str) -> AICompleteResponse:
     Parses the raw text from the AI, separating the narrative
     from the structured JSON metadata block.
     """
-    json_block_match = re.search(r"```json\n({.*?})\n```", response_text, re.DOTALL)
+    json_block_match = re.search(r"```json\r?\n({.*?})\r?\n```", response_text, re.DOTALL)
 
     text_content = response_text
     meta_data = None
@@ -37,14 +37,8 @@ async def get_ai_completion(
     user_code: str = Depends(get_current_user_code)
 ):
     """
-    Generates a response from the AI Dungeon Master.
+    Generates a response from the AI Dungeon Master using local Qwen inference.
     """
-    if not config.GEMINI_API_KEY or config.GEMINI_API_KEY == "__PUT_YOUR_KEY_HERE__":
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini API key is not configured on the server."
-        )
-
     # 1. Gather context
     campaign_details = await get_campaign_details(request.campaign_id, user_code)
     user_settings = await get_user_settings(user_code)
@@ -56,10 +50,7 @@ async def get_ai_completion(
         raise HTTPException(status_code=500, detail="System prompt file not found.")
 
     # 2. Construct the prompt
-    # The user already sends the message history, we just prepend the system prompt
-    # and provide context variables.
-    full_prompt_context = f"""
-{system_prompt}
+    full_prompt_context = f"""{system_prompt}
 
 ---
 ## Game Context
@@ -70,46 +61,48 @@ async def get_ai_completion(
 ---
 """
 
-    # Combine system prompt with the message history
-    messages_for_ai = [{"role": "system", "content": full_prompt_context}]
-
-    # Convert our Pydantic Message models to dicts for the AI
+    final_prompt_list = [full_prompt_context]
     for msg in request.messages:
-        # The Gemini API uses 'model' for the assistant's role
-        role = "model" if msg.role == "assistant" else msg.role
-        messages_for_ai.append({"role": role, "parts": [msg.content]})
+        final_prompt_list.append(f"**{msg.role.capitalize()}:** {msg.content}")
 
-    # 3. Call Gemini API
+    prompt_text = "\n".join(final_prompt_list)
+
+    # 3. Call local Qwen (Ollama API)
+    payload = {
+        "model": config.QWEN_TEXT_MODEL,
+        "prompt": prompt_text,
+        "stream": False,
+    }
+
     try:
-        genai.configure(api_key=config.GEMINI_API_KEY)
-        model = genai.GenerativeModel(config.GEMINI_MODEL)
+        async with httpx.AsyncClient(timeout=config.QWEN_TIMEOUT) as client:
+            response = await client.post(config.QWEN_API_URL, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            response_text = data.get("response", "")
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Timeout waiting for AI inference service ({config.QWEN_TIMEOUT}s): {str(exc)}"
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"AI service returned HTTP error {exc.response.status_code}: {exc.response.text}"
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to AI service: {str(exc)}"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error calling AI service: {str(exc)}"
+        )
 
-        # The API expects role/parts format. We need to adapt.
-        # Let's reformat the messages for the `generate_content` method
-        formatted_messages = []
-        for msg in request.messages:
-            role = "model" if msg.role == "assistant" else msg.role
-            formatted_messages.append({'role': role, 'parts': [msg.content]})
-
-        # The last message is the user's prompt, the history is the preceding messages
-        # The library wants a history list and a final prompt.
-        history = formatted_messages[:-1]
-        prompt = formatted_messages[-1]['parts'][0]
-
-        # Let's build a simpler message list, as the `chat` approach is tricky
-        # The `generate_content` method can take a simple list of strings/parts
-        final_prompt_list = [full_prompt_context]
-        for msg in request.messages:
-            final_prompt_list.append(f"**{msg.role.capitalize()}:** {msg.content}")
-
-        response = model.generate_content("\n".join(final_prompt_list))
-
-        # 4. Parse and return response
-        return parse_ai_response(response.text)
-
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        raise HTTPException(status_code=503, detail=f"An error occurred with the AI service: {str(e)}")
+    # 4. Parse and return response
+    return parse_ai_response(response_text)
 
 # Need to import these from the other routers to avoid circular dependencies
 from server.api.campaigns import get_campaign_details
